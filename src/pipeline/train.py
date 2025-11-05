@@ -32,10 +32,11 @@ def build_dataset(ohlcvs: dict[str, pd.DataFrame]) -> pd.DataFrame:
 def main():
     # Agents
     data_agent = DataAgent(DataAgentConfig())
-    symbols = data_agent.load_tickers(DATA / "tickers.csv")
-    ohlcvs = data_agent.download_ohlcv(symbols)
+    
+    # Load data from Excel file instead of downloading
+    ohlcvs = data_agent.load_from_excel(DATA / "Nifty_50.xlsx")
     if not ohlcvs:
-        print("No data downloaded. Check tickers or internet."); return
+        print("No data loaded from Excel. Check file path and format."); return
 
     df = build_dataset(ohlcvs)
     features = [c for c in df.columns if c not in ["target_up","symbol"]]
@@ -48,54 +49,100 @@ def main():
     X_train, X_test = X.iloc[:split], X.iloc[split:]
     y_train, y_test = y.iloc[:split], y.iloc[split:]
 
-    model_agent = ModelAgent(ModelAgentConfig())
-    clf = model_agent.train_calibrated(X_train, y_train)
+    model_agent = ModelAgent(ModelAgentConfig(
+        sequence_length=60,
+        hidden_size=128,
+        num_layers=2,
+        dropout=0.2,
+        learning_rate=0.001,
+        batch_size=64,
+        epochs=50
+    ))
+    model_agent.train_calibrated(X_train, y_train)
 
     # Basic eval
     proba_test = model_agent.predict_proba(X_test)
     metrics = model_agent.evaluate(X_test, y_test)
-    metrics["brier"] = float(brier_score_loss(y_test, proba_test))
+    
+    # Calculate Brier score with aligned lengths
+    min_len = min(len(proba_test), len(y_test))
+    metrics["brier"] = float(brier_score_loss(y_test.iloc[:min_len], proba_test[:min_len]))
     print("Eval:", metrics)
 
-    # Fit explainer
+    # Fit explainer (now uses attention mechanism)
     explainer = ExplainerAgent(ExplainerAgentConfig(topk=4))
-    explainer.fit(clf)
+    explainer.fit(model_agent)
 
     # Save artifacts
     MODELS.mkdir(parents=True, exist_ok=True)
-    save_joblib(clf, MODELS / "calibrated_xgb.joblib")
+    # Save PyTorch model
+    import torch
+    torch.save({
+        'model_state_dict': model_agent.model.state_dict(),
+        'scaler': model_agent.scaler,
+        'feature_names': model_agent.feature_names,
+        'config': model_agent.cfg
+    }, MODELS / "lstm_model.pth")
     save_json({"features": features}, MODELS / "meta.json")
 
     # Produce a small daily pick list (top-3 by p_up in last test day per symbol)
-    # For demo: take last available day per symbol from X_test
-    latest_idx = X_test.index.get_level_values(0) if isinstance(X_test.index, pd.MultiIndex) else X_test.index
-    last_date = latest_idx.max()
-    today_mask = (X_test.index == last_date)
-    X_today = X_test[today_mask]
-    df_today = df.loc[X_today.index]
-    proba_today = model_agent.predict_proba(X_today)
+    # For LSTM, we need to work with sequences, so let's get predictions for the full test set
+    # and then extract the last day per symbol
+    
+    # Get all predictions for test set
+    proba_test_full = model_agent.predict_proba(X_test)
+    
+    # Align indices
+    min_len = min(len(proba_test_full), len(X_test))
+    X_test_aligned = X_test.iloc[:min_len]
+    df_test_aligned = df.loc[X_test_aligned.index]
+    
+    # Group by symbol and get last entry for each
     picks = []
     risk_agent = RiskAgent(RiskAgentConfig())
-
-    for (i, row) in enumerate(X_today.to_dict("records")):
-        sym = df_today["symbol"].iloc[i]
-        last_close = df_today["Close"].iloc[i]
-        atr = df_today["atr_14"].iloc[i]
-        p_up = float(proba_today[i])
-        top_pairs = explainer.explain(X_today.iloc[[i]])
-        reason_text = explainer.to_reason_text(top_pairs, X_today.iloc[i])
-        risk = risk_agent.stops_targets(last_close, atr)
-        picks.append({
-            "ticker": sym, "p_up": p_up, "conviction": risk_agent.conviction_bucket(p_up),
-            "reason_text": reason_text, "stop_loss": risk["stop_loss"], "target": risk["target"],
-            "last_close": round(float(last_close), 2)
-        })
-
+    
+    if "symbol" in df_test_aligned.columns:
+        symbols = df_test_aligned["symbol"].unique()
+        
+        for sym in symbols:
+            # Get last occurrence of this symbol in test set
+            sym_mask = df_test_aligned["symbol"] == sym
+            sym_indices = df_test_aligned[sym_mask].index
+            
+            if len(sym_indices) == 0:
+                continue
+                
+            last_idx = sym_indices[-1]
+            row_position = df_test_aligned.index.get_loc(last_idx)
+            
+            # Get data for this symbol's last entry
+            last_close = df_test_aligned.loc[last_idx, "Close"]
+            atr = df_test_aligned.loc[last_idx, "atr_14"]
+            p_up = float(proba_test_full[row_position])
+            
+            # Get explanation using a window of data ending at this point
+            window_start = max(0, row_position - 60)
+            X_window = X_test_aligned.iloc[window_start:row_position+1]
+            
+            try:
+                top_pairs = explainer.explain(X_window)
+                reason_text = explainer.to_reason_text(top_pairs, X_test_aligned.iloc[row_position])
+            except Exception as e:
+                print(f"Warning: Could not generate explanation for {sym}: {e}")
+                reason_text = "LSTM model prediction based on 60-day sequence."
+            
+            risk = risk_agent.stops_targets(last_close, atr)
+            picks.append({
+                "ticker": sym, "p_up": p_up, "conviction": risk_agent.conviction_bucket(p_up),
+                "reason_text": reason_text, "stop_loss": risk["stop_loss"], "target": risk["target"],
+                "last_close": round(float(last_close), 2)
+            })
+    
     picks = sorted(picks, key=lambda d: d["p_up"], reverse=True)[:3]
 
     # Report
     rep = ReportAgent(ReportAgentConfig(outdir=REPORTS))
-    pdf_path = rep.save_simple_pdf(title="Explanation-First Forecaster — Top Picks", cards=picks, filename="daily_report.pdf")
+    pdf_path = rep.save_simple_pdf(title="LSTM with Attention — Top Picks", cards=picks, filename="daily_report.pdf")
     print("Saved report:", pdf_path)
 
 if __name__ == "__main__":

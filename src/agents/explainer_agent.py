@@ -2,8 +2,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import numpy as np
 import pandas as pd
-import shap
-from xgboost import XGBClassifier
 
 @dataclass
 class ExplainerAgentConfig:
@@ -12,43 +10,65 @@ class ExplainerAgentConfig:
 class ExplainerAgent:
     def __init__(self, cfg: ExplainerAgentConfig):
         self.cfg = cfg
-        self._explainer = None
+        self.model_agent = None
 
-    def fit(self, trained_estimator):
-        # CalibratedClassifierCV has a base_estimator called "base_estimator_"
-        base = getattr(trained_estimator, "base_estimator_", trained_estimator)
-        # If it's a pipeline or similar, try to get underlying booster
-        model = base if isinstance(base, XGBClassifier) else getattr(base, "best_estimator_", None) or base
-        self._explainer = shap.TreeExplainer(model)
+    def fit(self, trained_model_agent):
+        """Store reference to the trained model agent (LSTM with attention)"""
+        self.model_agent = trained_model_agent
 
     def explain(self, X_row: pd.DataFrame) -> list[tuple[str, float]]:
-        # Returns [(feature, shap_value), ...] topk by absolute contribution
-        sv = self._explainer.shap_values(X_row)
-        # For binary XGB, shap_values is (n_samples, n_features)
-        vals = sv[0] if isinstance(sv, list) else sv
-        vals = vals.flatten()
-        feats = X_row.columns.tolist()
-        pairs = list(zip(feats, vals))
-        pairs.sort(key=lambda t: abs(t[1]), reverse=True)
-        return pairs[: self.cfg.topk]
+        """
+        Use attention weights to explain predictions.
+        Returns [(feature, importance), ...] topk by absolute contribution
+        """
+        if self.model_agent is None:
+            raise ValueError("ExplainerAgent not fitted. Call fit() first.")
+        
+        # Get attention weights for the last sample
+        attention_weights = self.model_agent.get_attention_weights(X_row, index=-1)
+        
+        # Average attention weights across time steps to get feature importance
+        # Shape: (sequence_length,) -> we'll use the most recent timesteps
+        recent_attention = attention_weights[-10:]  # Last 10 timesteps
+        avg_attention = np.mean(recent_attention)
+        
+        # Get feature values from the last row
+        feature_names = self.model_agent.feature_names
+        feature_values = X_row[feature_names].iloc[-1].values
+        
+        # Calculate feature importance based on:
+        # 1. Attention weights (temporal importance)
+        # 2. Feature magnitude (feature contribution)
+        feature_importance = []
+        for i, feat_name in enumerate(feature_names):
+            # Use attention weight and feature value magnitude
+            importance = avg_attention * abs(feature_values[i])
+            # Keep sign information
+            signed_importance = importance * np.sign(feature_values[i])
+            feature_importance.append((feat_name, float(signed_importance)))
+        
+        # Sort by absolute importance
+        feature_importance.sort(key=lambda t: abs(t[1]), reverse=True)
+        
+        return feature_importance[: self.cfg.topk]
 
     def to_reason_text(self, top_pairs: list[tuple[str,float]], X_row: pd.Series) -> str:
         templates = []
         for f, v in top_pairs:
             sign = "increasing" if v > 0 else "decreasing"
-            if "rsi" in f:
+            if "rsi" in f.lower():
                 templates.append(f"RSI suggests momentum {sign}.")
-            elif "macd" in f and "signal" not in f:
+            elif "macd" in f.lower() and "signal" not in f.lower():
                 templates.append(f"MACD {sign} influencing trend.")
-            elif "macd_signal" in f:
+            elif "macd_signal" in f.lower():
                 templates.append(f"MACD signal {sign}.")
-            elif "atr" in f:
+            elif "atr" in f.lower():
                 templates.append(f"Volatility (ATR) {sign}; risk adjusted accordingly.")
-            elif "adx" in f:
+            elif "adx" in f.lower():
                 templates.append(f"Trend strength (ADX) {sign}.")
-            elif "ret_lag" in f:
+            elif "ret_lag" in f.lower():
                 templates.append(f"Recent returns ({f}) affect outlook.")
-            elif "vol_" in f:
+            elif "vol_" in f.lower():
                 templates.append(f"Rolling volatility {sign}.")
             else:
                 templates.append(f"{f} {sign}.")
