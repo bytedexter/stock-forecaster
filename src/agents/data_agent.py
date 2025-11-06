@@ -67,8 +67,9 @@ class DataAgent:
                             break
                     
                     if date_col:
-                        # Convert to datetime, ignoring timezone to avoid FutureWarning
-                        df['Date'] = pd.to_datetime(df[date_col], utc=True).dt.tz_localize(None)
+                        # Convert to datetime, handling timezone strings properly
+                        # First remove timezone info from the string, then convert
+                        df['Date'] = pd.to_datetime(df[date_col].astype(str).str.replace(r'\s+[A-Z]{2,4}$', '', regex=True), errors='coerce')
                         df.set_index('Date', inplace=True)
                         # Drop the original date column if it's different
                         if date_col != 'Date' and date_col in df.columns:

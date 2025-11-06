@@ -56,7 +56,7 @@ def main():
         dropout=0.2,
         learning_rate=0.001,
         batch_size=64,
-        epochs=50
+        epochs=10
     ))
     model_agent.train_calibrated(X_train, y_train)
 

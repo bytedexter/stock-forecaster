@@ -18,7 +18,7 @@ class ModelAgentConfig:
     dropout: float = 0.2
     learning_rate: float = 0.001
     batch_size: int = 64
-    epochs: int = 50
+    epochs: int = 10
     random_state: int = 42
 
 class StockDataset(Dataset):
