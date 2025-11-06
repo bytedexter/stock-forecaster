@@ -12,13 +12,13 @@ import joblib
 
 @dataclass
 class ModelAgentConfig:
-    sequence_length: int = 60
+    sequence_length: int = 7
     hidden_size: int = 128
     num_layers: int = 2
     dropout: float = 0.2
     learning_rate: float = 0.001
     batch_size: int = 64
-    epochs: int = 10
+    epochs: int = 1
     random_state: int = 42
 
 class StockDataset(Dataset):

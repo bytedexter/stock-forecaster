@@ -50,13 +50,13 @@ def main():
     y_train, y_test = y.iloc[:split], y.iloc[split:]
 
     model_agent = ModelAgent(ModelAgentConfig(
-        sequence_length=60,
+        sequence_length=7,
         hidden_size=128,
         num_layers=2,
         dropout=0.2,
         learning_rate=0.001,
         batch_size=64,
-        epochs=10
+        epochs=1
     ))
     model_agent.train_calibrated(X_train, y_train)
 
@@ -85,65 +85,220 @@ def main():
     }, MODELS / "lstm_model.pth")
     save_json({"features": features}, MODELS / "meta.json")
 
-    # Produce a small daily pick list (top-3 by p_up in last test day per symbol)
-    # For LSTM, we need to work with sequences, so let's get predictions for the full test set
-    # and then extract the last day per symbol
-    
-    # Get all predictions for test set
+    # Produce a small daily pick list using Gemini AI
+    # Get predictions for test set
     proba_test_full = model_agent.predict_proba(X_test)
     
-    # Align indices
-    min_len = min(len(proba_test_full), len(X_test))
-    X_test_aligned = X_test.iloc[:min_len]
-    df_test_aligned = df.loc[X_test_aligned.index]
+    print(f"Test set size: {len(X_test)}, Predictions size: {len(proba_test_full)}")
     
-    # Group by symbol and get last entry for each
-    picks = []
+    # Align predictions with test data
+    min_len = min(len(proba_test_full), len(X_test))
+    
+    if min_len == 0:
+        print("Warning: No predictions generated. Cannot create picks.")
+        return
+    
+    # Prepare data for Gemini - get last prediction per symbol
+    symbol_predictions = []
+    
+    # Build a cleaner mapping using test data directly
+    print("Building stock predictions data...")
+    
+    for i in range(min_len):
+        try:
+            # Get data from test set position
+            test_row = X_test.iloc[i]
+            test_idx = X_test.index[i]
+            
+            # Get corresponding row from df
+            df_row = df.loc[test_idx]
+            
+            # Handle case where loc returns Series (duplicate index) or scalar
+            if isinstance(df_row, pd.DataFrame):
+                # Multiple rows with same index, take first
+                symbol = str(df_row['symbol'].iloc[0])
+                close_price = float(df_row['Close'].iloc[0])
+                atr = float(df_row['atr_14'].iloc[0])
+            else:
+                # Single row
+                symbol = str(df_row['symbol'])
+                close_price = float(df_row['Close'])
+                atr = float(df_row['atr_14'])
+            
+            p_up = float(proba_test_full[i])
+            
+            symbol_predictions.append({
+                'symbol': symbol,
+                'close': close_price,
+                'atr': atr,
+                'p_up': p_up,
+                'index': i
+            })
+        except Exception as e:
+            # Skip problematic rows
+            continue
+    
+    print(f"Processed {len(symbol_predictions)} predictions")
+    
+    # Group by symbol and get last prediction for each
+    pred_df = pd.DataFrame(symbol_predictions)
+    
+    if len(pred_df) == 0:
+        print("Warning: No predictions to process. Cannot create picks.")
+        return
+    
+    last_predictions = pred_df.groupby('symbol').tail(1)
+    
+    print(f"\nPreparing data for {len(last_predictions)} symbols to send to Gemini AI...")
+    
+    # Prepare summary for Gemini
+    stock_data_summary = []
     risk_agent = RiskAgent(RiskAgentConfig())
     
-    if "symbol" in df_test_aligned.columns:
-        symbols = df_test_aligned["symbol"].unique()
+    for _, row in last_predictions.iterrows():
+        sym = row['symbol']
+        p_up = row['p_up']
+        close = row['close']
+        atr = row['atr']
         
-        for sym in symbols:
-            # Get last occurrence of this symbol in test set
-            sym_mask = df_test_aligned["symbol"] == sym
-            sym_indices = df_test_aligned[sym_mask].index
-            
-            if len(sym_indices) == 0:
-                continue
-                
-            last_idx = sym_indices[-1]
-            row_position = df_test_aligned.index.get_loc(last_idx)
-            
-            # Get data for this symbol's last entry
-            last_close = df_test_aligned.loc[last_idx, "Close"]
-            atr = df_test_aligned.loc[last_idx, "atr_14"]
-            p_up = float(proba_test_full[row_position])
-            
-            # Get explanation using a window of data ending at this point
-            window_start = max(0, row_position - 60)
-            X_window = X_test_aligned.iloc[window_start:row_position+1]
-            
-            try:
-                top_pairs = explainer.explain(X_window)
-                reason_text = explainer.to_reason_text(top_pairs, X_test_aligned.iloc[row_position])
-            except Exception as e:
-                print(f"Warning: Could not generate explanation for {sym}: {e}")
-                reason_text = "LSTM model prediction based on 60-day sequence."
-            
-            risk = risk_agent.stops_targets(last_close, atr)
+        risk = risk_agent.stops_targets(close, atr)
+        conviction = risk_agent.conviction_bucket(p_up)
+        
+        stock_data_summary.append({
+            'ticker': sym,
+            'probability_up': f"{p_up:.2%}",
+            'conviction': conviction,
+            'last_close': round(float(close), 2),
+            'stop_loss': risk['stop_loss'],
+            'target': risk['target'],
+            'atr': round(float(atr), 2)
+        })
+    
+    # Sort by probability
+    stock_data_summary = sorted(stock_data_summary, key=lambda x: float(x['probability_up'].strip('%'))/100, reverse=True)
+    
+    # Send to Gemini to generate report
+    print("\n🤖 Sending data to Gemini AI for intelligent report generation...")
+    
+    import os
+    from google import genai
+    
+    # Set API key as environment variable
+    os.environ['GEMINI_API_KEY'] = "AIzaSyABLqP9xZVNJ7BgbQpFKlZlsh7CUn6Qq6g"
+    client = genai.Client()
+    
+    # Create comprehensive prompt
+    prompt = f"""You are an expert financial analyst. I have prediction data for {len(stock_data_summary)} Indian stocks (NSE).
+
+Your task: Analyze this data and select the TOP 3 stock picks for tomorrow based on the probability of upward movement.
+
+Here is ALL the stock data (sorted by probability):
+
+{pd.DataFrame(stock_data_summary).to_string()}
+
+Requirements for your report:
+1. Select the TOP 3 stocks with highest probability of upward movement
+2. For each stock, provide:
+   - Ticker symbol
+   - Conviction level (HIGH/MEDIUM/LOW based on probability: >60%=HIGH, 50-60%=MEDIUM, <50%=LOW)
+   - Probability percentage
+   - Current price (last_close)
+   - Target price (from data)
+   - Stop loss (from data)
+   - A professional 2-3 sentence plain-English explanation of WHY this is a good pick, considering the probability, risk/reward ratio, and conviction level
+
+Format your response EXACTLY as a JSON array like this:
+[
+  {{
+    "ticker": "SYMBOL.NS",
+    "conviction": "HIGH",
+    "p_up": 0.65,
+    "last_close": 1234.56,
+    "target": 1300.00,
+    "stop_loss": 1200.00,
+    "reason_text": "Your professional explanation here..."
+  }},
+  ...3 stocks total...
+]
+
+Return ONLY the JSON array, no other text."""
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.0-flash-exp",
+            contents=prompt
+        )
+        response_text = response.text.strip()
+        
+        # Extract JSON from response
+        import json
+        import re
+        
+        # Try to find JSON array in response
+        json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
+        if json_match:
+            picks = json.loads(json_match.group())
+            print(f"✅ Gemini generated {len(picks)} stock picks!")
+        else:
+            print("⚠ Could not parse Gemini response, using fallback...")
+            # Fallback to top 3 from our data
+            picks = []
+            for stock in stock_data_summary[:3]:
+                picks.append({
+                    "ticker": stock['ticker'],
+                    "conviction": stock['conviction'],
+                    "p_up": float(stock['probability_up'].strip('%'))/100,
+                    "last_close": stock['last_close'],
+                    "target": stock['target'],
+                    "stop_loss": stock['stop_loss'],
+                    "reason_text": f"LSTM model predicts {stock['probability_up']} probability of upward movement with {stock['conviction']} conviction based on 7-day technical analysis."
+                })
+    
+    except Exception as e:
+        print(f"⚠ Gemini API error: {e}")
+        print("Using fallback method...")
+        # Fallback to top 3
+        picks = []
+        for stock in stock_data_summary[:3]:
             picks.append({
-                "ticker": sym, "p_up": p_up, "conviction": risk_agent.conviction_bucket(p_up),
-                "reason_text": reason_text, "stop_loss": risk["stop_loss"], "target": risk["target"],
-                "last_close": round(float(last_close), 2)
+                "ticker": stock['ticker'],
+                "conviction": stock['conviction'],
+                "p_up": float(stock['probability_up'].strip('%'))/100,
+                "last_close": stock['last_close'],
+                "target": stock['target'],
+                "stop_loss": stock['stop_loss'],
+                "reason_text": f"LSTM model predicts {stock['probability_up']} probability of upward movement with {stock['conviction']} conviction based on 7-day technical analysis."
             })
     
-    picks = sorted(picks, key=lambda d: d["p_up"], reverse=True)[:3]
-
+    # Display picks
+    print("\n" + "="*60)
+    print("📊 TOP 3 STOCK PICKS")
+    print("="*60)
+    for i, pick in enumerate(picks, 1):
+        print(f"\n#{i} {pick['ticker']}")
+        print(f"   Conviction: {pick['conviction']} | Probability: {pick['p_up']:.1%}")
+        print(f"   Price: ₹{pick['last_close']} | Target: ₹{pick['target']} | Stop: ₹{pick['stop_loss']}")
+        print(f"   {pick['reason_text']}")
+    print("\n" + "="*60)
+    
+    print(f"\nGenerated {len(picks)} picks for report")
+    
     # Report
-    rep = ReportAgent(ReportAgentConfig(outdir=REPORTS))
-    pdf_path = rep.save_simple_pdf(title="LSTM with Attention — Top Picks", cards=picks, filename="daily_report.pdf")
-    print("Saved report:", pdf_path)
+    REPORTS.mkdir(parents=True, exist_ok=True)
+    rep = ReportAgent(ReportAgentConfig(
+        outdir=REPORTS,
+        gemini_api_key=None,  # Already used Gemini above
+        enhance_with_llm=False  # Disable double-enhancement
+    ))
+    
+    try:
+        pdf_path = rep.save_simple_pdf(title="Stock Picks — Daily Report", cards=picks, filename="daily_report.pdf")
+        print(f"\n✅ Report saved successfully: {pdf_path}")
+        print(f"📄 Open the report to see detailed analysis of top 3 stocks!")
+    except Exception as e:
+        print(f"❌ Error generating report: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
